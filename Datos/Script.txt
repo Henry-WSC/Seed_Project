@@ -1,0 +1,185 @@
+# Instalación de paquetes necesarios
+!pip install scikit-learn torch torchvision pycocotools pillow
+
+# Celda 1: Importaciones y configuración inicial
+import os
+import torch
+import torchvision
+from torchvision.models.detection import maskrcnn_resnet50_fpn
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
+from torch.utils.data import Dataset, DataLoader, Subset
+from pycocotools.coco import COCO
+from PIL import Image
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+
+# Configuración de rutas y parámetros
+coco_file_path = r'C:\Users\HENRY\Documents\Seed_Project\Project_germination\result.json'
+image_dir = r'C:\Users\HENRY\Documents\Seed_Project\Project_germination\images'
+output_dir = 'output_masks'
+num_classes = 2  # Fondo + 1 clase (semillas)
+batch_size = 2
+num_epochs = 10
+learning_rate = 0.005
+
+# Celda 2: Definición del conjunto de datos
+class SeedDataset(Dataset):
+    def __init__(self, coco, image_dir, transforms=None):
+        self.coco = coco
+        self.image_dir = image_dir
+        self.transforms = transforms
+        self.ids = list(self.coco.imgs.keys())
+
+    def __getitem__(self, index):
+        img_id = self.ids[index]
+        ann_ids = self.coco.getAnnIds(imgIds=img_id)
+        anns = self.coco.loadAnns(ann_ids)
+        
+        img_info = self.coco.loadImgs(img_id)[0]
+        img_path = os.path.join(self.image_dir, img_info['file_name'])
+        img = Image.open(img_path).convert("RGB")
+        
+        num_objs = len(anns)
+        boxes = []
+        masks = []
+        for i in range(num_objs):
+            xmin = anns[i]['bbox'][0]
+            ymin = anns[i]['bbox'][1]
+            xmax = xmin + anns[i]['bbox'][2]
+            ymax = ymin + anns[i]['bbox'][3]
+            boxes.append([xmin, ymin, xmax, ymax])
+            mask = self.coco.annToMask(anns[i])
+            masks.append(mask)
+        
+        boxes = torch.as_tensor(boxes, dtype=torch.float32)
+        masks = torch.as_tensor(masks, dtype=torch.uint8)
+        
+        image_id = torch.tensor([img_id])
+        area = (boxes[:, 3] - boxes[:, 1]) * (boxes[:, 2] - boxes[:, 0])
+        iscrowd = torch.zeros((num_objs,), dtype=torch.int64)
+        
+        target = {}
+        target["boxes"] = boxes
+        target["masks"] = masks
+        target["image_id"] = image_id
+        target["area"] = area
+        target["iscrowd"] = iscrowd
+        
+        if self.transforms is not None:
+            img, target = self.transforms(img, target)
+        
+        return img, target
+
+    def __len__(self):
+        return len(self.ids)
+
+# Celda 3: Funciones auxiliares
+def get_model(num_classes):
+    model = maskrcnn_resnet50_fpn(pretrained=True)
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+    in_features_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
+    hidden_layer = 256
+    model.roi_heads.mask_predictor = MaskRCNNPredictor(in_features_mask, hidden_layer, num_classes)
+    return model
+
+def get_subset_indices(dataset, num_images):
+    return torch.randperm(len(dataset))[:num_images].tolist()
+
+def visualize_and_export_masks(model, dataset, indices, output_dir):
+    model.eval()
+    device = next(model.parameters()).device
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    for idx in indices:
+        image, target = dataset[idx]
+        image_tensor = torchvision.transforms.functional.to_tensor(image).unsqueeze(0).to(device)
+        
+        with torch.no_grad():
+            prediction = model(image_tensor)[0]
+        
+        image_np = np.array(image)
+        masks = prediction['masks'].cpu().numpy()
+        
+        plt.figure(figsize=(15, 5))
+        plt.subplot(1, 3, 1)
+        plt.imshow(image_np)
+        plt.title('Original Image')
+        
+        plt.subplot(1, 3, 2)
+        plt.imshow(image_np)
+        for mask in masks:
+            plt.imshow(mask[0], alpha=0.5, cmap='jet')
+        plt.title('Predicted Masks')
+        
+        plt.subplot(1, 3, 3)
+        plt.imshow(image_np)
+        for mask in target['masks']:
+            plt.imshow(mask.numpy(), alpha=0.5, cmap='jet')
+        plt.title('Ground Truth Masks')
+        
+        plt.savefig(os.path.join(output_dir, f'mask_comparison_{idx}.png'))
+        plt.close()
+        
+        for i, mask in enumerate(masks):
+            mask_image = Image.fromarray((mask[0] * 255).astype(np.uint8))
+            mask_image.save(os.path.join(output_dir, f'mask_{idx}_{i}.png'))
+
+# Celda 4: Preparación de los datos
+coco = COCO(coco_file_path)
+dataset = SeedDataset(coco, image_dir)
+
+# Dividir los datos en conjuntos de entrenamiento, validación y prueba
+train_indices, temp_indices = train_test_split(range(len(dataset)), test_size=0.3, random_state=42)
+val_indices, test_indices = train_test_split(temp_indices, test_size=0.33, random_state=42)
+
+train_dataset = Subset(dataset, train_indices)
+val_dataset = Subset(dataset, val_indices)
+test_dataset = Subset(dataset, test_indices)
+
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, collate_fn=lambda x: tuple(zip(*x)))
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, collate_fn=lambda x: tuple(zip(*x)))
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, collate_fn=lambda x: tuple(zip(*x)))
+
+print(f"Tamaño del conjunto de entrenamiento: {len(train_dataset)}")
+print(f"Tamaño del conjunto de validación: {len(val_dataset)}")
+print(f"Tamaño del conjunto de prueba: {len(test_dataset)}")
+
+# Celda 5: Preentrenamiento (usando un subconjunto pequeño)
+device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+model = get_model(num_classes)
+model.to(device)
+
+params = [p for p in model.parameters() if p.requires_grad]
+optimizer = torch.optim.SGD(params, lr=learning_rate, momentum=0.9, weight_decay=0.0005)
+
+# Seleccionar un subconjunto pequeño para preentrenamiento
+pretraining_indices = get_subset_indices(train_dataset, 5)
+pretraining_dataset = Subset(train_dataset, pretraining_indices)
+pretraining_loader = DataLoader(pretraining_dataset, batch_size=2, shuffle=True, num_workers=4, collate_fn=lambda x: tuple(zip(*x)))
+
+# Preentrenamiento
+num_pretraining_epochs = 5
+for epoch in range(num_pretraining_epochs):
+    model.train()
+    for images, targets in pretraining_loader:
+        images = list(image.to(device) for image in images)
+        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        
+        loss_dict = model(images, targets)
+        losses = sum(loss for loss in loss_dict.values())
+        
+        optimizer.zero_grad()
+        losses.backward()
+        optimizer.step()
+        
+        print(f"Preentrenamiento - Epoch: {epoch}, Loss: {losses.item()}")
+
+print("Preentrenamiento completado!")
+
+# Exportar máscaras después del preentrenamiento
+visualize_and_export_masks(model, dataset, pretraining_indices, os.path.join(output_dir, 'pretraining'))
+
